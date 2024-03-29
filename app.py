@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import csv
 import json
 import logging
 import os
@@ -16,10 +17,25 @@ DEFAULT_API_VER = 2
 LIMIT_DEFAULT = 100000
 JIRA_PROJECT_DEFAULT = "https://redpandadata.atlassian.net"
 API_BASE = '{url}/rest/api/{api_version}'
+CSV_GITHUB_USERNAME = 'Github Username'
+CSV_NAME = 'Name'
+CSV_EMAIL = 'Email'
+EXPECTED_FIELD_NAMES = [CSV_GITHUB_USERNAME, CSV_NAME, CSV_EMAIL]
+
+
+class NoUserExists(Exception):
+
+    def __init__(self, email: str):
+        super().__init__(f'No Jira user exists with email {email}')
+        self._email = email
+
+    @property
+    def email(self):
+        return self._email
 
 
 class GithubIssueImport(object):
-    _issue_list_pattern = 'gh issue list -R {repo} --json title,labels,url,body,comments,number -L {limit}'
+    _issue_list_pattern = 'gh issue list -R {repo} --json title,labels,url,body,comments,number,author,assignees -L {limit}'
     _post_headers = {
         'Accept': 'application/json',
         'Content-Type': 'application/json'
@@ -27,10 +43,11 @@ class GithubIssueImport(object):
     _get_headers = {'Accept': 'application/json'}
     _api_base = '{url}/rest/api/{api_version}/'
     _api_version = 2
+    _null_panda_email = 'noreply@redpanda.com'
 
     def __init__(self, logger: logging.Logger, github_repo: str, limit: int,
                  jira_user: str, jira_token: str, jira_url: str,
-                 jira_project: str):
+                 jira_project: str, user_mapper: csv.DictReader):
         self._logger = logger
         self._github_repo = github_repo
         self._limit = limit
@@ -38,6 +55,19 @@ class GithubIssueImport(object):
         self._jira_token = jira_token
         self._jira_url = jira_url
         self._jira_project = jira_project
+        self._null_panda_user = self._get_jira_user(self._null_panda_email)
+        # Holds mapping of Github user name to the Jira user
+        # If the Github user does not exist in Jira, NullPanda is used instead
+        self._mapped_users = self._create_user_mapping(user_mapper,
+                                                       self._null_panda_user)
+
+    def _create_user_mapping(self, user_mapper: csv.DictReader,
+                             default_user: str):
+        rv = {}
+        for row in user_mapper:
+            rv[row[CSV_GITHUB_USERNAME]] = self._get_jira_user_with_default(
+                row[CSV_EMAIL], default_user)
+        return rv
 
     def run(self):
         self._logger.info(
@@ -72,6 +102,28 @@ class GithubIssueImport(object):
         return HTTPBasicAuth(username=self._jira_user,
                              password=self._jira_token)
 
+    def _get_jira_user(self, email: str) -> str:
+        self._logger.debug(f'Querying JIRA for user with email {email}')
+        query = {'query': email}
+        resp = json.loads(
+            self._submit_jira_api_request(method='GET',
+                                          endpoint='user/search',
+                                          params=query,
+                                          headers=self._get_headers).text)
+        if len(resp) == 0:
+            raise NoUserExists(email=email)
+
+        self._logger.debug(
+            f'Jira user with email {email}: {resp[0]["accountId"]}')
+        return resp[0]["accountId"]
+
+    def _get_jira_user_with_default(self, email: str,
+                                    default_user: str) -> str:
+        try:
+            return self._get_jira_user(email)
+        except NoUserExists:
+            return default_user
+
     def _import_issues(self, issues: List):
         self._logger.debug(
             f'Starting to import {len(issues)} issues into project {self._jira_project} at {self._jira_url}'
@@ -87,11 +139,17 @@ class GithubIssueImport(object):
                 continue
             labels = [label['name'] for label in issue["labels"]]
             issue_type = "Bug" if 'kind/bug' in labels else "Task"
+            reporter = self._mapped_users.get(issue["author"]["login"],
+                                              self._null_panda_user)
+            assignee = None
+            if len(issue["assignees"]) > 0:
+                assignee = self._mapped_users.get(
+                    issue["assignees"][0]["login"], self._null_panda_user)
 
             self._logger.debug(
                 f'Creating issue of type {issue_type} titled "{issue["title"]}" with labels "{labels}"'
             )
-            payload = json.dumps({
+            payload = {
                 "fields": {
                     "description": issue["body"],
                     "summary": issue["title"],
@@ -102,9 +160,17 @@ class GithubIssueImport(object):
                     "project": {
                         "key": self._jira_project
                     },
+                    "reporter": {
+                        "id": reporter
+                    },
                     "customfield_10052": issue["url"]
                 }
-            })
+            }
+
+            if assignee is not None:
+                payload["fields"]["assignee"] = {"id": assignee}
+
+            payload = json.dumps(payload)
             response = self._submit_jira_api_request(
                 method="POST",
                 endpoint="issue",
@@ -176,8 +242,8 @@ class GithubIssueImport(object):
         if 'data' in kwargs:
             log_message += f' containing data {kwargs["data"]}'
 
-        if 'parameters' in kwargs:
-            log_message += f' with parameters {kwargs["parameters"]}'
+        if 'params' in kwargs:
+            log_message += f' with parameters {kwargs["params"]}'
 
         self._logger.debug(log_message)
 
@@ -191,11 +257,14 @@ class GithubIssueImport(object):
 
 def main() -> int:
     args = parse_args()
+    reader = csv.DictReader(args.user_mapping)
+    assert reader.fieldnames == EXPECTED_FIELD_NAMES, f'Invalid field names.  Expected {EXPECTED_FIELD_NAMES} but got {reader.fieldnames}'
     logger = logging.getLogger(__name__)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
     issue_importer = GithubIssueImport(logger, args.github_repo, args.limit,
                                        args.jira_user, args.jira_token,
-                                       args.jira_url, args.jira_project)
+                                       args.jira_url, args.jira_project,
+                                       reader)
     try:
         issue_importer.run()
     except RuntimeError as e:
@@ -230,6 +299,13 @@ def parse_args() -> argparse.Namespace:
                         '--jira-project',
                         help="Jira project to import into",
                         required=True)
+    parser.add_argument(
+        '-m',
+        '--user-mapping',
+        help=
+        'Path to the CSV file containing mapping of github user with redpanda email address',
+        required=True,
+        type=argparse.FileType('r'))
     return parser.parse_args()
 
 
