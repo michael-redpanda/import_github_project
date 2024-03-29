@@ -77,7 +77,7 @@ class GithubIssueImport(object):
             f'Starting to import {len(issues)} issues into project {self._jira_project} at {self._jira_url}'
         )
 
-        for issue in issues:
+        for issue in reversed(issues):
             self._logger.debug(
                 f"Checking to see if a JIRA issue exists that's linked to '{issue['url']}'"
             )
@@ -130,7 +130,7 @@ class GithubIssueImport(object):
             if insert_jira_link:
                 jira_issue_url = f'{self._jira_url}/browse/{issue_key}'
                 issue_body = issue[
-                    "body"] + f"\n\nJIRA Link: [{issue_key}]({jira_issue_url})"
+                                 "body"] + f"\n\nJIRA Link: [{issue_key}]({jira_issue_url})"
                 with tempfile.NamedTemporaryFile(delete=False) as tf:
                     tf.write(issue_body.encode())
                     tf.flush()
@@ -139,7 +139,7 @@ class GithubIssueImport(object):
                         f"gh issue edit {issue['url']} --body-file {tf.name}")
                     os.unlink(tf.name)
 
-            for c in issue["comments"]:
+            for c in reversed(issue["comments"]):
                 self._add_comment_to_issue(issue_id, c['body'])
 
             self._logger.info(f'Successfully created JIRA Issue {issue_key}')
@@ -147,7 +147,7 @@ class GithubIssueImport(object):
     def _jira_issue_linked_to_gh_issue(self, gh_url) -> bool:
         query = {
             'jql':
-            f'project = {self._jira_project} and "External GitHub Issue[URL Field]" = "{gh_url}"',
+                f'project = {self._jira_project} and "External GitHub Issue[URL Field]" = "{gh_url}"',
             'fields': 'summary'
         }
         self._logger.debug(
