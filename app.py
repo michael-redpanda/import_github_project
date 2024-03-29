@@ -3,8 +3,10 @@
 import argparse
 import json
 import logging
+import os
 import subprocess
 import sys
+import tempfile
 from typing import List
 
 import requests
@@ -121,16 +123,21 @@ class GithubIssueImport(object):
                 f'Adding boilerplate message to issue {issue_key}')
             self._add_comment_to_issue(issue_id, message)
 
-            # jira_issue_url = f'{self._jira_url}/browse/{issue_key}'
-            # issue_body = issue[
-            #     "body"] + f"\n\nJIRA Link: [{issue_key}]({jira_issue_url})"
-            # with tempfile.NamedTemporaryFile(delete=False) as tf:
-            #     tf.write(issue_body.encode())
-            #     tf.flush()
-            #     tf.close()
-            #     self._run_cmd_return_stdout(
-            #         f"gh issue edit {issue['url']} --body-file {tf.name}")
-            #     os.unlink(tf.name)
+            # The backport issues that were autocreated lack the trailing ``` and so the link shows up weird
+            # within the code block so don't insert the JIRA link for kind/backports
+            insert_jira_link = 'kind/backport' not in labels
+
+            if insert_jira_link:
+                jira_issue_url = f'{self._jira_url}/browse/{issue_key}'
+                issue_body = issue[
+                    "body"] + f"\n\nJIRA Link: [{issue_key}]({jira_issue_url})"
+                with tempfile.NamedTemporaryFile(delete=False) as tf:
+                    tf.write(issue_body.encode())
+                    tf.flush()
+                    tf.close()
+                    self._run_cmd_return_stdout(
+                        f"gh issue edit {issue['url']} --body-file {tf.name}")
+                    os.unlink(tf.name)
 
             for c in issue["comments"]:
                 self._add_comment_to_issue(issue_id, c['body'])
@@ -156,13 +163,6 @@ class GithubIssueImport(object):
         self._logger.debug(f'Found {total_issues} issues linked to "{gh_url}"')
 
         return total_issues != 0
-
-    @staticmethod
-    def _label_exists(labels: List, label: str) -> bool:
-        for l in labels:
-            if l["name"] == label:
-                return True
-        return False
 
     def _run_cmd_return_stdout(self, cmd: str) -> str:
         self._logger.debug(f'Executing command "{cmd}"')
