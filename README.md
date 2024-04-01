@@ -21,6 +21,16 @@ python3 -m venv venv
 pip install -r requirements.txt
 ```
 
+### Mapping File
+
+Not saved with this repo, but you will need a CSV file that maps
+Redpanda Github users to their Redpanda emails. The CSV file
+should have the following header:
+
+```csv
+Github Username,Name,Email
+```
+
 ## Running Application
 
 ```bash
