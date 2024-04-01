@@ -168,7 +168,9 @@ class GithubIssueImport(object):
             if issue_exists:
                 self._logger.info(f'Skipping issue {issue["number"]}')
                 continue
-            labels = [label['name'] for label in issue["labels"]]
+            labels = [
+                label['name'].replace(" ", "-") for label in issue["labels"]
+            ]
             issue_type = "Bug" if 'kind/bug' in labels else "Task"
             assignee = None
             if len(issue["assignees"]) > 0:
