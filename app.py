@@ -61,6 +61,37 @@ class GithubIssueImport(object):
         self._mapped_users = self._create_user_mapping(user_mapper,
                                                        self._null_panda_user)
 
+    def _create_issue(self,
+                      description: str,
+                      summary: str,
+                      issue_type: str,
+                      labels: [str],
+                      project_key: str,
+                      issue_url: str,
+                      assignee: str = None):
+        payload = {
+            "fields": {
+                "description": description,
+                "summary": summary,
+                "issuetype": {
+                    "name": issue_type
+                },
+                "labels": labels,
+                "project": {
+                    "key": project_key
+                },
+                "customfield_10052": issue_url
+            }
+        }
+        if assignee is not None:
+            payload["fields"]["assignee"] = {"id": assignee}
+
+        payload = json.dumps(payload)
+        return self._submit_jira_api_request(method="POST",
+                                             endpoint="issue",
+                                             data=payload,
+                                             headers=self._post_headers)
+
     def _create_user_mapping(self, user_mapper: csv.DictReader,
                              default_user: str):
         rv = {}
@@ -139,8 +170,6 @@ class GithubIssueImport(object):
                 continue
             labels = [label['name'] for label in issue["labels"]]
             issue_type = "Bug" if 'kind/bug' in labels else "Task"
-            reporter = self._mapped_users.get(issue["author"]["login"],
-                                              self._null_panda_user)
             assignee = None
             if len(issue["assignees"]) > 0:
                 assignee = self._mapped_users.get(
@@ -149,34 +178,24 @@ class GithubIssueImport(object):
             self._logger.debug(
                 f'Creating issue of type {issue_type} titled "{issue["title"]}" with labels "{labels}"'
             )
-            payload = {
-                "fields": {
-                    "description": issue["body"],
-                    "summary": issue["title"],
-                    "issuetype": {
-                        "name": issue_type
-                    },
-                    "labels": labels,
-                    "project": {
-                        "key": self._jira_project
-                    },
-                    "reporter": {
-                        "id": reporter
-                    },
-                    "customfield_10052": issue["url"]
-                }
-            }
+            resp = self._create_issue(issue["body"], issue["title"],
+                                      issue_type, labels, self._jira_project,
+                                      issue["url"], assignee)
 
-            if assignee is not None:
-                payload["fields"]["assignee"] = {"id": assignee}
+            response = json.loads(resp.text)
+            if assignee is not None and not resp.ok and "errors" in response and "assignee" in response[
+                    "errors"]:
+                self._logger.debug(
+                    f'Resubmitting creation of issue with no assignee due to error: {response["errors"]}'
+                )
+                response = json.loads(
+                    self._create_issue(issue["body"], issue["title"],
+                                       issue_type, labels, self._jira_project,
+                                       issue["url"], None).text)
 
-            payload = json.dumps(payload)
-            response = self._submit_jira_api_request(
-                method="POST",
-                endpoint="issue",
-                data=payload,
-                headers=self._post_headers)
-            response = json.loads(response.text)
+            if "errors" in response:
+                raise RuntimeError(f'{response["errors"]}')
+
             issue_key = response['key']
             issue_id = response['id']
             message = """
@@ -196,7 +215,7 @@ class GithubIssueImport(object):
             if insert_jira_link:
                 jira_issue_url = f'{self._jira_url}/browse/{issue_key}'
                 issue_body = issue[
-                                 "body"] + f"\n\nJIRA Link: [{issue_key}]({jira_issue_url})"
+                    "body"] + f"\n\nJIRA Link: [{issue_key}]({jira_issue_url})"
                 with tempfile.NamedTemporaryFile(delete=False) as tf:
                     tf.write(issue_body.encode())
                     tf.flush()
@@ -213,7 +232,7 @@ class GithubIssueImport(object):
     def _jira_issue_linked_to_gh_issue(self, gh_url) -> bool:
         query = {
             'jql':
-                f'project = {self._jira_project} and "External GitHub Issue[URL Field]" = "{gh_url}"',
+            f'project = {self._jira_project} and "External GitHub Issue[URL Field]" = "{gh_url}"',
             'fields': 'summary'
         }
         self._logger.debug(
