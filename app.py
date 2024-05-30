@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
-
 import argparse
 import csv
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
-from typing import List
+from typing import List, Optional
 
-import requests
-from requests.auth import HTTPBasicAuth
+from atlassian import Jira
 
 DEFAULT_API_VER = 2
 LIMIT_DEFAULT = 100000
@@ -21,6 +20,7 @@ CSV_GITHUB_USERNAME = 'Github Username'
 CSV_NAME = 'Name'
 CSV_EMAIL = 'Email'
 EXPECTED_FIELD_NAMES = [CSV_GITHUB_USERNAME, CSV_NAME, CSV_EMAIL]
+JIRA_ISSUE_CHARACTER_LIMIT = 32767
 
 
 class NoUserExists(Exception):
@@ -36,18 +36,19 @@ class NoUserExists(Exception):
 
 class GithubIssueImport(object):
     _issue_list_pattern = 'gh issue list -R {repo} --json title,labels,url,body,comments,number,author,assignees -L {limit}'
-    _post_headers = {
-        'Accept': 'application/json',
-        'Content-Type': 'application/json'
-    }
-    _get_headers = {'Accept': 'application/json'}
-    _api_base = '{url}/rest/api/{api_version}/'
-    _api_version = 2
     _null_panda_email = 'noreply@redpanda.com'
 
-    def __init__(self, logger: logging.Logger, github_repo: str, limit: int,
-                 jira_user: str, jira_token: str, jira_url: str,
-                 jira_project: str, user_mapper: csv.DictReader):
+    def __init__(self,
+                 logger: logging.Logger,
+                 github_repo: str,
+                 limit: int,
+                 jira_user: str,
+                 jira_token: str,
+                 jira_url: str,
+                 jira_project: str,
+                 user_mapper: csv.DictReader,
+                 pandoc: Optional[str],
+                 add_link: bool = True):
         self._logger = logger
         self._github_repo = github_repo
         self._limit = limit
@@ -55,6 +56,12 @@ class GithubIssueImport(object):
         self._jira_token = jira_token
         self._jira_url = jira_url
         self._jira_project = jira_project
+        self._pandoc = pandoc
+        self._add_link = add_link
+        self._jira = Jira(url=self._jira_url,
+                          username=self._jira_user,
+                          password=self._jira_token,
+                          cloud=True)
         self._null_panda_user = self._get_jira_user(self._null_panda_email)
         # Holds mapping of Github user name to the Jira user
         # If the Github user does not exist in Jira, NullPanda is used instead
@@ -69,28 +76,23 @@ class GithubIssueImport(object):
                       project_key: str,
                       issue_url: str,
                       assignee: str = None):
-        payload = {
-            "fields": {
-                "description": description,
-                "summary": summary,
-                "issuetype": {
-                    "name": issue_type
-                },
-                "labels": labels,
-                "project": {
-                    "key": project_key
-                },
-                "customfield_10052": issue_url
-            }
+        fields = {
+            "description": description,
+            "summary": summary,
+            "issuetype": {
+                "name": issue_type
+            },
+            "labels": labels,
+            "project": {
+                "key": project_key
+            },
+            "customfield_10052": issue_url
         }
-        if assignee is not None:
-            payload["fields"]["assignee"] = {"id": assignee}
 
-        payload = json.dumps(payload)
-        return self._submit_jira_api_request(method="POST",
-                                             endpoint="issue",
-                                             data=payload,
-                                             headers=self._post_headers)
+        if assignee is not None:
+            fields["assignee"] = {"id": assignee}
+
+        return self._jira.issue_create(fields=fields)
 
     def _create_user_mapping(self, user_mapper: csv.DictReader,
                              default_user: str):
@@ -99,6 +101,18 @@ class GithubIssueImport(object):
             rv[row[CSV_GITHUB_USERNAME]] = self._get_jira_user_with_default(
                 row[CSV_EMAIL], default_user)
         return rv
+
+    def _ghm_to_jira(self, ghm: str):
+        if self._pandoc is not None:
+            with tempfile.NamedTemporaryFile(delete=False) as tf:
+                tf.write(ghm.encode())
+                tf.flush()
+                tf.close()
+                jmd = self._run_cmd_return_stdout(
+                    f'{self._pandoc} -f gfm -w jira {tf.name}')
+                os.unlink(tf.name)
+                return jmd
+        return ghm
 
     def run(self):
         self._logger.info(
@@ -112,12 +126,9 @@ class GithubIssueImport(object):
         self._import_issues(issues)
 
     def _add_comment_to_issue(self, issue_id, comment):
+        comment = self._ghm_to_jira(comment)
         self._logger.debug(f'Adding comment "{comment}" to issue {issue_id}')
-        payload = json.dumps({"body": comment})
-        self._submit_jira_api_request(method="POST",
-                                      endpoint=f'issue/{issue_id}/comment',
-                                      headers=self._post_headers,
-                                      data=payload)
+        self._jira.issue_add_comment(issue_key=issue_id, comment=comment)
 
     def _collect_issues(self) -> List:
         return json.loads(
@@ -125,22 +136,9 @@ class GithubIssueImport(object):
                 self._issue_list_pattern.format(repo=self._github_repo,
                                                 limit=self._limit)))
 
-    def _form_url(self, endpoint: str) -> str:
-        return self._api_base.format(url=self._jira_url,
-                                     api_version=self._api_version) + endpoint
-
-    def _get_auth(self) -> HTTPBasicAuth:
-        return HTTPBasicAuth(username=self._jira_user,
-                             password=self._jira_token)
-
     def _get_jira_user(self, email: str) -> str:
         self._logger.debug(f'Querying JIRA for user with email {email}')
-        query = {'query': email}
-        resp = json.loads(
-            self._submit_jira_api_request(method='GET',
-                                          endpoint='user/search',
-                                          params=query,
-                                          headers=self._get_headers).text)
+        resp = self._jira.user_find_by_user_string(query=email)
         if len(resp) == 0:
             raise NoUserExists(email=email)
 
@@ -177,47 +175,53 @@ class GithubIssueImport(object):
                 assignee = self._mapped_users.get(
                     issue["assignees"][0]["login"], self._null_panda_user)
 
+            issue_body = self._ghm_to_jira(issue["body"])
+
+            issue_cut_off = len(issue_body) > JIRA_ISSUE_CHARACTER_LIMIT
+
             self._logger.debug(
                 f'Creating issue of type {issue_type} titled "{issue["title"]}" with labels "{labels}"'
             )
-            resp = self._create_issue(issue["body"], issue["title"],
-                                      issue_type, labels, self._jira_project,
-                                      issue["url"], assignee)
+            response = self._create_issue(
+                issue_body[:JIRA_ISSUE_CHARACTER_LIMIT], issue["title"],
+                issue_type, labels, self._jira_project, issue["url"], assignee)
 
-            response = json.loads(resp.text)
-            if assignee is not None and not resp.ok and "errors" in response and "assignee" in response[
-                    "errors"]:
+            if assignee is not None and response is None:
                 self._logger.debug(
-                    f'Resubmitting creation of issue with no assignee due to error: {response["errors"]}'
+                    f'Resubmitting creation of issue with no assignee due to error'
                 )
-                response = json.loads(
-                    self._create_issue(issue["body"], issue["title"],
-                                       issue_type, labels, self._jira_project,
-                                       issue["url"], None).text)
+                response = self._create_issue(
+                    issue_body[:JIRA_ISSUE_CHARACTER_LIMIT], issue["title"],
+                    issue_type, labels, self._jira_project, issue["url"], None)
 
-            if "errors" in response:
-                raise RuntimeError(f'{response["errors"]}')
+            if response is None:
+                raise RuntimeError("Failed to create issue")
 
             issue_key = response['key']
             issue_id = response['id']
             message = """
-            JIRA Issue created from GitHub issue.  Any updates in JIRA will _not_ be pushed back
-            to the GitHub issue.  New comments from GitHub will sync with JIRA issue, but not
-            modifications.  Please refer to the External GitHub Link field to get to the GitHub
-            issue that triggered this issue's creation.
+JIRA Issue created from GitHub issue.  Any updates in JIRA will _not_ be pushed back
+to the GitHub issue.  New comments from GitHub will sync with JIRA issue, but not
+modifications.  Please refer to the External GitHub Link field to get to the GitHub
+issue that triggered this issue's creation.
             """
+            if issue_cut_off:
+                message += """
+The issue has been truncated due to issue length limitations.
+Please refer to the original Github issue for the full issue body.
+                """
             self._logger.debug(
                 f'Adding boilerplate message to issue {issue_key}')
             self._add_comment_to_issue(issue_id, message)
 
             # The backport issues that were autocreated lack the trailing ``` and so the link shows up weird
             # within the code block so don't insert the JIRA link for kind/backports
-            insert_jira_link = 'kind/backport' not in labels
+            insert_jira_link = 'kind/backport' not in labels and self._add_link
 
             if insert_jira_link:
                 jira_issue_url = f'{self._jira_url}/browse/{issue_key}'
                 issue_body = issue[
-                    "body"] + f"\n\nJIRA Link: [{issue_key}]({jira_issue_url})"
+                                 "body"] + f"\n\nJIRA Link: [{issue_key}]({jira_issue_url})"
                 with tempfile.NamedTemporaryFile(delete=False) as tf:
                     tf.write(issue_body.encode())
                     tf.flush()
@@ -232,20 +236,11 @@ class GithubIssueImport(object):
             self._logger.info(f'Successfully created JIRA Issue {issue_key}')
 
     def _jira_issue_linked_to_gh_issue(self, gh_url) -> bool:
-        query = {
-            'jql':
-            f'project = {self._jira_project} and "External GitHub Issue[URL Field]" = "{gh_url}"',
-            'fields': 'summary'
-        }
+        jql_request = f'project = {self._jira_project} and "External GitHub Issue[URL Field]" = "{gh_url}"'
+        resp = self._jira.jql(jql=jql_request, fields='summary')
         self._logger.debug(
             f'Submitting request to find JIRA issue with GitHub link "{gh_url}"'
         )
-
-        resp = json.loads(
-            self._submit_jira_api_request(method='GET',
-                                          endpoint='search',
-                                          params=query,
-                                          headers=self._get_headers).text)
         total_issues: int = resp["total"]
         self._logger.debug(f'Found {total_issues} issues linked to "{gh_url}"')
 
@@ -255,26 +250,6 @@ class GithubIssueImport(object):
         self._logger.debug(f'Executing command "{cmd}"')
         return subprocess.check_output(cmd.split(' ')).decode()
 
-    def _submit_jira_api_request(self, method, endpoint,
-                                 **kwargs) -> requests.Response:
-        url = self._form_url(endpoint)
-        log_message = f'Sending {method} to {url}'
-
-        if 'data' in kwargs:
-            log_message += f' containing data {kwargs["data"]}'
-
-        if 'params' in kwargs:
-            log_message += f' with parameters {kwargs["params"]}'
-
-        self._logger.debug(log_message)
-
-        resp = requests.request(method=method,
-                                url=url,
-                                auth=self._get_auth(),
-                                **kwargs)
-        self._logger.debug(f'Response: {resp.text}')
-        return resp
-
 
 def main() -> int:
     args = parse_args()
@@ -282,15 +257,27 @@ def main() -> int:
     assert reader.fieldnames == EXPECTED_FIELD_NAMES, f'Invalid field names.  Expected {EXPECTED_FIELD_NAMES} but got {reader.fieldnames}'
     logger = logging.getLogger(__name__)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
-    issue_importer = GithubIssueImport(logger, args.github_repo, args.limit,
-                                       args.jira_user, args.jira_token,
-                                       args.jira_url, args.jira_project,
-                                       reader)
+    pandoc: Optional[
+        str] = args.pandoc if args.pandoc is not None else find_prog('pandoc')
+    issue_importer = GithubIssueImport(logger,
+                                       args.github_repo,
+                                       args.limit,
+                                       args.jira_user,
+                                       args.jira_token,
+                                       args.jira_url,
+                                       args.jira_project,
+                                       reader,
+                                       pandoc=pandoc,
+                                       add_link=not args.dont_add_link)
     try:
         issue_importer.run()
     except RuntimeError as e:
         logger.error(f'Failed executing issue importer: {e}')
     return 0
+
+
+def find_prog(prog) -> Optional[str]:
+    return shutil.which(prog)
 
 
 def parse_args() -> argparse.Namespace:
@@ -327,6 +314,10 @@ def parse_args() -> argparse.Namespace:
         'Path to the CSV file containing mapping of github user with redpanda email address',
         required=True,
         type=argparse.FileType('r'))
+    parser.add_argument('--pandoc', help='Path to pandoc executable')
+    parser.add_argument('--dont-add-link',
+                        help='Set this to not add the link',
+                        action='store_true')
     return parser.parse_args()
 
 

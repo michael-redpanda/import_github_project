@@ -4,6 +4,12 @@ This script will create JIRA issues from Github issues.
 
 ## Prerequisites
 
+### Clone this repo
+
+```commandline
+git clone https://github.com/michael-redpanda/import_github_project
+```
+
 ### JIRA Token
 
 Create a JIRA token following the instructions
@@ -16,6 +22,7 @@ Install the `gh` CLI and login using `gh auth login`
 ### Python environment
 
 ```bash
+cd import_github_project
 python3 -m venv venv
 . ./venv/bin/activate
 pip install -r requirements.txt
@@ -29,6 +36,15 @@ should have the following header:
 
 ```csv
 Github Username,Name,Email
+```
+
+### `pandoc` application
+
+This script now supports converting GH markdown to Jira markdown by
+using `pandoc`. Install pandoc on your system. For MacOS use:
+
+```commandline
+brew install pandoc
 ```
 
 ## Running Application
